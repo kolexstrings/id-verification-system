@@ -1,0 +1,5 @@
+graph TD
+    A[Processing Step Fails] --> B[Stop Current Step]
+    B --> C[Mark Overall Status as Failed]  
+    C --> D[Include Partial Results]
+    D --> E[Return Error with Partial Data]

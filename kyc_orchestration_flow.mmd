@@ -1,0 +1,31 @@
+graph TD
+    A[Frontend: Send Complete KYCProfile] --> B[Backend: Validate Required Data]
+    B --> C{Valid Data?}
+    C -->|❌ No| D[Return Validation Error]
+    C -->|✅ Yes| E[Create Customer Record]
+    
+    E --> F[Document Verification]
+    F --> F1[Analyze Document Images]
+    F1 --> F2[Extract & Verify Document Data]
+    F2 --> F3[Return Document Results]
+    
+    F3 --> G[Face Biometrics Analysis]
+    G --> G1[Detect Face in Selfie]
+    G1 --> G2[Check for Face Mask]
+    G2 --> G3[Return Face Analysis Results]
+    
+    G3 --> H[Liveness Detection]
+    H --> H1[Configure Analysis Type]
+    H1 --> H2[Analyze Selfie Images]
+    H2 --> H3[Return Liveness Results]
+    
+    H3 --> I[Face Comparison]
+    I --> I1[Compare Document Face vs Selfie]
+    I1 --> I2[Calculate Similarity Score]
+    I2 --> I3[Return Comparison Results]
+    
+    I3 --> J[Compile All Results]
+    J --> K[Return Complete Response]
+    
+    D --> End([Error Response])
+    K --> End([Success Response])
