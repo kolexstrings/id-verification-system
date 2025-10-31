@@ -97,9 +97,14 @@ export class KYCVerificationController {
         ]);
       }
 
-      // Step 1: Create customer
-      const customer = await innovatricsClient.createCustomer({
-        externalId: kycData.userId || `${kycData.name}_${kycData.surname}_${Date.now()}`, // Prefer userId from frontend
+      // Step 1: Create customer (Innovatrics generates UUID)
+      const customer = await innovatricsClient.createCustomer();
+
+      const externalId = kycData.userId || `${kycData.name}_${kycData.surname}_${Date.now()}`;
+
+      // Step 2: Store customer in Trust Platform with external ID
+      await innovatricsClient.storeCustomer(customer.id, {
+        externalId,
         onboardingStatus: 'IN_PROGRESS'
       });
 
