@@ -274,7 +274,7 @@ export class KYCVerificationController {
         // Process ALL selfies (primary + additional from files or body)
         const additionalSelfieFiles = files.selfieImages || [];
         const totalSelfies = 1 + additionalSelfieFiles.length + selfieImagesFromBody.length;
-        console.log(`\n📸 Processing ${totalSelfies} selfie(s) for face matching...`);
+        console.log(`\nProcessing ${totalSelfies} selfie(s) for face matching...`);
         console.log(`   - Primary selfie: 1`);
         console.log(`   - Additional (files): ${additionalSelfieFiles.length}`);
         console.log(`   - Additional (base64): ${selfieImagesFromBody.length}`);
@@ -339,14 +339,14 @@ export class KYCVerificationController {
         };
         
         console.log('\n' + '='.repeat(70));
-        console.log('🔍 Face Matching Results (Multi-Selfie Analysis):');
+        console.log('Face Matching Results (Multi-Selfie Analysis):');
         console.log('='.repeat(70));
         console.log('   Selfies Analyzed:', faceMatchScores.length);
         console.log('   Individual Scores:', faceMatchScores.map(s => `${(s * 100).toFixed(1)}%`).join(', '));
         console.log('   Average Score:', (faceMatchScore * 100).toFixed(1) + '%');
         console.log('   Best Score:', (maxScore * 100).toFixed(1) + '%');
         console.log('   Worst Score:', (minScore * 100).toFixed(1) + '%');
-        console.log('   Final Result:', faceMatchScore >= 0.7 ? '✅ MATCH' : '❌ NO MATCH');
+        console.log('   Final Result:', faceMatchScore >= 0.65 ? '✅ MATCH' : '❌ NO MATCH');
         
         console.log('='.repeat(70) + '\n');
         await recordFaceComparison(customerId, {
@@ -354,38 +354,93 @@ export class KYCVerificationController {
           image: primarySelfieSource.normalized,
         });
 
-        // Step 6: Use inspection-based liveness check (simpler, more reliable)
+        // Step 6: Real passive liveness check with multiple selfies
         console.log('\n' + '='.repeat(70));
-        console.log('STEP 6: Checking liveness from selfie inspection');
+        console.log('STEP 6: Performing passive liveness detection');
         console.log('='.repeat(70));
         
-        // Get customer inspection for liveness/mask detection
-        const customerInspection = await innovatricsClient.inspectCustomer(customerId);
-        const hasMask = customerInspection?.selfieInspection?.hasMask || false;
+        // Initialize liveness record
+        console.log('Initializing liveness record...');
+        await innovatricsClient.ensureLivenessRecord(customerId);
+        console.log('✅ Liveness record initialized');
         
-        // Simple liveness based on mask detection and face quality
-        const livenessResult = {
-          status: hasMask ? 'not_live' : 'live',
-          confidence: hasMask ? 0 : 0.9
-        };
+        // Upload additional selfies for better liveness detection
+        let uploadedFrames = 1; // Primary already uploaded in Step 3
+        
+        // Upload additional selfies from FILES to liveness record
+        for (let i = 0; i < additionalSelfieFiles.length; i++) {
+          console.log(`Uploading additional selfie ${i + 1} for liveness...`);
+          const additionalSelfie = await resolveImageSource({
+            file: additionalSelfieFiles[i],
+            base64: undefined,
+            defaultFileName: `${userIdForTracking}_liveness_${i + 1}`,
+            tags: ['kyc', 'selfie', 'liveness'],
+          });
+          
+          if (additionalSelfie) {
+            await innovatricsClient.uploadSelfie(customerId, additionalSelfie.innovatrics);
+            uploadedFrames++;
+            console.log(`   ✅ Frame ${uploadedFrames} uploaded`);
+          }
+        }
+        
+        // Upload additional selfies from BASE64 to liveness record
+        for (let i = 0; i < selfieImagesFromBody.length; i++) {
+          console.log(`Uploading additional base64 selfie ${i + 1} for liveness...`);
+          const additionalSelfie = await resolveImageSource({
+            file: undefined,
+            base64: selfieImagesFromBody[i],
+            defaultFileName: `${userIdForTracking}_liveness_base64_${i + 1}`,
+            tags: ['kyc', 'selfie', 'liveness'],
+          });
+          
+          if (additionalSelfie) {
+            await innovatricsClient.uploadSelfie(customerId, additionalSelfie.innovatrics);
+            uploadedFrames++;
+            console.log(`   ✅ Frame ${uploadedFrames} uploaded`);
+          }
+        }
+        
+        console.log(`\nTotal frames for liveness: ${uploadedFrames}`);
+        
+        // Evaluate passive liveness with all frames
+        console.log('Evaluating passive liveness...');
+        const livenessResult = await innovatricsClient.evaluateLiveness(customerId, {
+          deepfakeCheck: true // Enable deepfake detection
+        });
 
         // Store the liveness results
-        results.livenessCheck = {
-          confidence: livenessResult.confidence,
-          status: livenessResult.status
-        };
+        const hasLivenessResult = livenessResult && typeof livenessResult === 'object';
+        if (hasLivenessResult) {
+          results.livenessCheck = {
+            confidence: livenessResult.confidence,
+            status: livenessResult.status,
+            ...(livenessResult.isDeepfake !== undefined && { 
+              isDeepfake: livenessResult.isDeepfake,
+              deepfakeConfidence: livenessResult.deepfakeConfidence 
+            })
+          };
 
-        console.log('\nSUCCESS: Liveness check completed');
-        console.log('   Status:', livenessResult.status.toUpperCase());
-        console.log('   Confidence:', (livenessResult.confidence * 100).toFixed(1) + '%');
-        console.log('   Has Mask:', hasMask ? 'YES (suspicious)' : 'NO');
-        console.log('   Full result:', JSON.stringify(livenessResult, null, 2));
-        console.log('='.repeat(70) + '\n');
+          console.log('\nSUCCESS: Liveness check completed');
+          console.log('   Status:', livenessResult.status ? livenessResult.status.toUpperCase() : 'N/A');
+          console.log('   Confidence:', (livenessResult.confidence * 100).toFixed(1) + '%');
+          if (livenessResult.isDeepfake !== undefined) {
+            console.log('   Deepfake Detection:', livenessResult.isDeepfake ? '⚠️  DETECTED' : '✅ PASSED');
+          }
+          console.log('   Full result:', JSON.stringify(livenessResult, null, 2));
+          console.log('='.repeat(70) + '\n');
 
-        await recordLivenessResult(customerId, {
-          livenessResult,
-          image: primarySelfieSource.normalized,
-        });
+          await recordLivenessResult(customerId, {
+            livenessResult,
+            image: primarySelfieSource.normalized,
+          });
+        } else {
+          console.log('⚠️  Liveness evaluation returned no result');
+          results.livenessCheck = {
+            confidence: 0,
+            status: 'unknown'
+          };
+        }
 
         // Update overall status
         results.overallStatus = 'completed';
@@ -410,7 +465,7 @@ export class KYCVerificationController {
         console.log('   Document Verified:', results.documentVerification ? 'YES' : 'NO');
         console.log('   Selfie Uploaded:', results.selfieUpload ? 'YES' : 'NO');
         console.log('   Liveness Check:', results.livenessCheck ? (results.livenessCheck.status ? results.livenessCheck.status.toUpperCase() : 'INCONCLUSIVE') : 'SKIPPED');
-        console.log('   Face Match:', (results.faceComparison?.score ?? 0) >= 0.7 ? 'PASSED' : 'FAILED');
+        console.log('   Face Match:', (results.faceComparison?.score ?? 0) >= 0.65 ? 'PASSED' : 'FAILED');
         console.log('='.repeat(70) + '\n');
         
         return ResponseHandler.success(
