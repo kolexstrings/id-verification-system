@@ -5,6 +5,155 @@ import { withRetry, RetryOptions } from '../utils/retry';
 
 export type InnovatricsImagePayload = string | { url: string };
 
+const INNOVATRICS_DOCUMENT_TYPE_MAP: Record<string, string> = {
+  passport: 'PASSPORT',
+  id_card: 'ID_CARD',
+  driver_license: 'DRIVER_LICENSE',
+  residence_permit: 'RESIDENCE_PERMIT',
+  visa: 'VISA',
+};
+
+const INNOVATRICS_ERROR_MAP: Record<
+  string,
+  {
+    summary: string;
+    remediation?: string;
+  }
+> = {
+  INVALID_REQUEST_BODY: {
+    summary: 'Innovatrics rejected the request payload',
+    remediation:
+      'Check document advice (types/countries/pageTypes) and required fields.',
+  },
+  INVALID_IMAGE_FORMAT: {
+    summary: 'Image format not supported',
+    remediation: 'Ensure JPEG or PNG images are provided.',
+  },
+  INVALID_IMAGE: {
+    summary: 'Image validation failed',
+    remediation: 'Verify base64 payload and make sure image is not corrupted.',
+  },
+  INVALID_IMAGE_RESOLUTION: {
+    summary: 'Image resolution outside allowed range',
+    remediation:
+      'Resize images so the longer side is <= 3000px and facial region is clear.',
+  },
+  IMAGE_TOO_SMALL: {
+    summary: 'Image is too small for processing',
+    remediation: 'Upload higher-resolution document or selfie image.',
+  },
+  DOCUMENT_NOT_SUPPORTED: {
+    summary: 'Document not supported by Innovatrics',
+    remediation: 'Use a supported document type for the selected country.',
+  },
+  NO_DOCUMENT_MATCH: {
+    summary: 'No document matched the provided advice',
+    remediation:
+      'Verify document type/country advice values align with Innovatrics catalogue.',
+  },
+  DOCUMENT_ALREADY_PROCESSED: {
+    summary: 'Document was already processed for this customer',
+    remediation:
+      'Inspect existing document state or reset before reprocessing.',
+  },
+  NOT_ENOUGH_DATA: {
+    summary: 'Liveness evaluation lacks sufficient data',
+    remediation: 'Upload higher-quality selfie frames or additional selfies.',
+  },
+  LIVENESS_NOT_READY: {
+    summary: 'Liveness resources not ready yet',
+    remediation: 'Wait and retry evaluation after required data is uploaded.',
+  },
+  CUSTOMER_NOT_FOUND: {
+    summary: 'Innovatrics customer not found',
+    remediation: 'Ensure customer creation succeeded and IDs are correct.',
+  },
+};
+
+const INNOVATRICS_ADVICE_GUIDANCE: Array<{
+  matcher: (advice: any) => boolean;
+  summary: string;
+  remediation?: string;
+}> = [
+  {
+    matcher: advice =>
+      !!advice?.classification?.message &&
+      advice.classification.message
+        .toLowerCase()
+        .includes('no document matches'),
+    summary: 'Provided document type/country combination is not recognized.',
+    remediation:
+      'Double-check classification advice types/countries sent to Innovatrics.',
+  },
+  {
+    matcher: advice => advice?.quality?.reason === 'IMAGE_TOO_SMALL',
+    summary: 'Document image too small to extract data.',
+    remediation:
+      'Provide higher-resolution scans (longer side at least 1000px, preferred 1800px).',
+  },
+  {
+    matcher: advice => advice?.quality?.reason === 'FACE_NOT_FOUND',
+    summary: 'Face region not detected on the provided image.',
+    remediation: 'Ensure document portrait is visible and unobstructed.',
+  },
+];
+
+export interface InnovatricsErrorContext {
+  operation: string;
+  status?: number;
+  errorCode?: string;
+  errorMessage?: string;
+  adviceSummary?: string;
+  remediation?: string;
+  advice?: any;
+  headers?: Record<string, any>;
+  request?: {
+    method?: string;
+    url?: string;
+    stage?: string;
+  };
+  raw?: any;
+}
+
+export class InnovatricsApiError extends Error {
+  readonly context: InnovatricsErrorContext;
+
+  constructor(message: string, context: InnovatricsErrorContext) {
+    super(message);
+    this.name = 'InnovatricsApiError';
+    this.context = context;
+  }
+
+  get userMessage(): string {
+    const parts: string[] = [];
+    if (this.context.errorCode) {
+      parts.push(`[${this.context.errorCode}]`);
+    }
+    if (this.context.adviceSummary) {
+      parts.push(this.context.adviceSummary);
+    }
+    if (
+      this.context.errorMessage &&
+      !parts.includes(this.context.errorMessage)
+    ) {
+      parts.push(this.context.errorMessage);
+    }
+    if (this.context.remediation) {
+      parts.push(this.context.remediation);
+    }
+
+    const message = parts.join(' ');
+    return message.length > 0 ? message : this.message;
+  }
+
+  serialize() {
+    return {
+      message: this.message,
+      context: this.context,
+    };
+  }
+}
+
 export interface CustomerStoreRequest {
   externalId?: string;
   onboardingStatus: 'IN_PROGRESS' | 'FINISHED';
@@ -62,7 +211,8 @@ export interface CreateLivenessRequest {
   options?: LivenessCheckOptions;
 }
 
-export const DEFAULT_LIVENESS_CHALLENGE: LivenessChallengeType = 'EYE_GAZE_LIVENESS';
+export const DEFAULT_LIVENESS_CHALLENGE: LivenessChallengeType =
+  'EYE_GAZE_LIVENESS';
 
 export function normalizeLivenessChallengeType(
   rawType?: string | null
@@ -158,38 +308,401 @@ export class InnovatricsService {
       maxContentLength: 50 * 1024 * 1024, // 50MB
       proxy: false,
       httpsAgent: new https.Agent({
-        rejectUnauthorized: false,
         keepAlive: true,
       }),
     });
 
-    // Add response interceptor for error handling
     this.client.interceptors.response.use(
       response => response,
       error => {
-        console.error('=== INNOVATRICS API ERROR (DETAILED) ===');
-        console.error('Status:', error.response?.status);
-        console.error('Status Text:', error.response?.statusText);
-        console.error('Error Data:', JSON.stringify(error.response?.data, null, 2));
-        console.error('Error Headers:', error.response?.headers);
-        console.error('Request URL:', error.config?.url);
-        console.error('Request Method:', error.config?.method);
-        console.error('Request Data Preview:', 
-          error.config?.data ? 
-            (typeof error.config.data === 'string' ? 
-              error.config.data.substring(0, 500) + '...' : 
-              JSON.stringify(error.config.data, null, 2).substring(0, 500) + '...') 
-            : 'N/A'
-        );
-        console.error('Full Error Message:', error.message);
-        console.error('Error Stack:', error.stack);
-        console.error('=========================================');
-        return Promise.reject(error);
+        const normalized = this.normalizeAxiosError(error, {
+          operation: 'request',
+        });
+        console.error('Innovatrics API error:', normalized.logPayload);
+        return Promise.reject(normalized.error);
       }
     );
   }
 
   // Customer Management
+
+  private normalizeDocumentTypeForAdvice(
+    documentType?: string
+  ): string | undefined {
+    if (!documentType) {
+      return undefined;
+    }
+
+    const normalized = documentType.trim().toLowerCase();
+    const mapped = INNOVATRICS_DOCUMENT_TYPE_MAP[normalized];
+    if (mapped) {
+      return mapped;
+    }
+
+    const sanitized = normalized
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .toUpperCase();
+
+    return sanitized.length ? sanitized : undefined;
+  }
+
+  private normalizeCountryForAdvice(country?: string): string | undefined {
+    if (!country) {
+      return undefined;
+    }
+
+    const trimmed = country.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+
+    const upper = trimmed.toUpperCase();
+
+    if (/^[A-Z]{2}$/.test(upper) || /^[A-Z]{3}$/.test(upper)) {
+      return upper;
+    }
+
+    const sanitized = trimmed
+      .toLowerCase()
+      .replace(/[^a-z]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    // Basic fallback for common variations
+    const COMMON_COUNTRY_MAP: Record<string, string> = {
+      nigeria: 'NGA',
+      'nigeria (ng)': 'NGA',
+      'federal republic of nigeria': 'NGA',
+      ghana: 'GHA',
+      kenya: 'KEN',
+      uganda: 'UGA',
+      'south africa': 'ZAF',
+      'united states': 'USA',
+      'united states of america': 'USA',
+      'united kingdom': 'GBR',
+      england: 'GBR',
+      scotland: 'GBR',
+      wales: 'GBR',
+      'northern ireland': 'GBR',
+      canada: 'CAN',
+      germany: 'DEU',
+      france: 'FRA',
+      italy: 'ITA',
+      spain: 'ESP',
+      portugal: 'PRT',
+      netherlands: 'NLD',
+      belgium: 'BEL',
+      switzerland: 'CHE',
+      'czech republic': 'CZE',
+      poland: 'POL',
+      india: 'IND',
+      china: 'CHN',
+      japan: 'JPN',
+      singapore: 'SGP',
+      australia: 'AUS',
+      'new zealand': 'NZL',
+    };
+
+    return COMMON_COUNTRY_MAP[sanitized];
+  }
+
+  private redactPayload(payload: unknown): unknown {
+    if (!payload || typeof payload !== 'object') {
+      if (typeof payload === 'string' && payload.length > 200) {
+        return `[string:${payload.length}]`;
+      }
+      return payload;
+    }
+
+    if (Array.isArray(payload)) {
+      return payload.map(item => this.redactPayload(item));
+    }
+
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(payload)) {
+      if (!value) {
+        result[key] = value;
+        continue;
+      }
+
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        const looksLikeBase64 =
+          /^[A-Za-z0-9+/=]+$/.test(trimmed) && trimmed.length > 80;
+        if (
+          looksLikeBase64 ||
+          key.toLowerCase().includes('data') ||
+          key.toLowerCase().includes('image')
+        ) {
+          result[key] = `[base64:${trimmed.length}]`;
+        } else if (trimmed.length > 300) {
+          result[key] = `[string:${trimmed.length}]`;
+        } else {
+          result[key] = trimmed;
+        }
+        continue;
+      }
+
+      result[key] = this.redactPayload(value);
+    }
+
+    return result;
+  }
+
+  private summarizeAdvice(advice: any): {
+    summary?: string;
+    remediation?: string;
+  } {
+    if (!advice) {
+      return {};
+    }
+
+    if (Array.isArray(advice)) {
+      const aggregated = advice
+        .map(item => this.summarizeAdvice(item))
+        .filter(item => item.summary || item.remediation);
+      const summary = aggregated
+        .map(item => item.summary)
+        .filter(Boolean)
+        .join(' | ');
+      const remediation = aggregated
+        .map(item => item.remediation)
+        .filter(Boolean)
+        .join(' | ');
+
+      const result: { summary?: string; remediation?: string } = {};
+      if (summary.length) {
+        result.summary = summary;
+      }
+      if (remediation.length) {
+        result.remediation = remediation;
+      }
+
+      return result;
+    }
+
+    if (typeof advice === 'string') {
+      return { summary: advice };
+    }
+
+    const matched = INNOVATRICS_ADVICE_GUIDANCE.find(entry =>
+      entry.matcher(advice)
+    );
+
+    const parts: string[] = [];
+
+    if (advice.message) {
+      parts.push(advice.message);
+    }
+
+    if (advice.details) {
+      parts.push(advice.details);
+    }
+
+    const classification = advice.classification;
+    if (classification) {
+      const classificationParts: string[] = [];
+      if (classification.message) {
+        classificationParts.push(classification.message);
+      }
+      if (classification.types?.length) {
+        classificationParts.push(`types=${classification.types.join(',')}`);
+      }
+      if (classification.countries?.length) {
+        classificationParts.push(
+          `countries=${classification.countries.join(',')}`
+        );
+      }
+      if (classification.pageTypes?.length) {
+        classificationParts.push(
+          `pageTypes=${classification.pageTypes.join(',')}`
+        );
+      }
+      if (classificationParts.length) {
+        parts.push(`classification(${classificationParts.join(' | ')})`);
+      }
+    }
+
+    const quality = advice.quality;
+    if (quality) {
+      const qualityParts: string[] = [];
+      if (quality.reason) {
+        qualityParts.push(quality.reason);
+      }
+      if (quality.score) {
+        qualityParts.push(`score=${quality.score}`);
+      }
+      if (qualityParts.length) {
+        parts.push(`quality(${qualityParts.join(' | ')})`);
+      }
+    }
+
+    const summary = parts.length ? parts.join(' | ') : undefined;
+
+    const result: { summary?: string; remediation?: string } = {};
+    if (matched?.summary) {
+      result.summary = matched.summary;
+    } else if (summary) {
+      result.summary = summary;
+    }
+
+    if (matched?.remediation) {
+      result.remediation = matched.remediation;
+    }
+
+    return result;
+  }
+
+  private normalizeAxiosError(
+    error: any,
+    context: { operation: string; stage?: string }
+  ): { error: InnovatricsApiError; logPayload: Record<string, unknown> } {
+    if (error instanceof InnovatricsApiError) {
+      return {
+        error,
+        logPayload: error.serialize(),
+      };
+    }
+
+    const status = error.response?.status;
+    const data = error.response?.data ?? {};
+    const errorCode = data.errorCode ?? data.code;
+    const errorMessage = data.errorMessage ?? data.message ?? error.message;
+    const advice = data.advice ?? data.details;
+    const adviceSummary = this.summarizeAdvice(advice);
+    const knownError = errorCode ? INNOVATRICS_ERROR_MAP[errorCode] : undefined;
+
+    const requestData = (() => {
+      if (!error.config?.data) {
+        return undefined;
+      }
+
+      try {
+        const parsed =
+          typeof error.config.data === 'string'
+            ? JSON.parse(error.config.data)
+            : error.config.data;
+        return this.redactPayload(parsed);
+      } catch {
+        return this.redactPayload(error.config.data);
+      }
+    })();
+
+    const messageParts: string[] = [
+      `Innovatrics ${context.operation} failed`,
+      status ? `status ${status}` : undefined,
+      errorCode ? `code ${errorCode}` : undefined,
+      knownError?.summary,
+      adviceSummary?.summary,
+    ].filter(Boolean) as string[];
+
+    const finalMessage =
+      messageParts.join(' - ') || errorMessage || error.message;
+
+    const requestContext: { method?: string; url?: string; stage?: string } =
+      {};
+    if (error.config?.method) {
+      requestContext.method = error.config.method;
+    }
+    if (error.config?.url) {
+      requestContext.url = error.config.url;
+    }
+    if (context.stage) {
+      requestContext.stage = context.stage;
+    }
+
+    const errorContext: InnovatricsErrorContext = {
+      operation: context.operation,
+    };
+    if (typeof status === 'number') {
+      errorContext.status = status;
+    }
+    if (errorCode) {
+      errorContext.errorCode = errorCode;
+    }
+    if (errorMessage) {
+      errorContext.errorMessage = errorMessage;
+    }
+    const adviceSummaryText = adviceSummary?.summary;
+    if (typeof adviceSummaryText === 'string' && adviceSummaryText.length > 0) {
+      errorContext.adviceSummary = adviceSummaryText;
+    }
+    const remediationHint =
+      adviceSummary?.remediation ?? knownError?.remediation;
+    if (typeof remediationHint === 'string' && remediationHint.length > 0) {
+      errorContext.remediation = remediationHint;
+    }
+    if (advice !== undefined) {
+      errorContext.advice = advice;
+    }
+    if (error.response?.headers) {
+      errorContext.headers = error.response.headers;
+    }
+    if (Object.keys(requestContext).length > 0) {
+      errorContext.request = requestContext;
+    }
+    if (data !== undefined) {
+      errorContext.raw = data;
+    }
+
+    const innovatricsError = new InnovatricsApiError(
+      finalMessage,
+      errorContext
+    );
+
+    const logPayload: Record<string, unknown> = {
+      error: innovatricsError.serialize(),
+      status,
+      errorCode,
+      errorMessage,
+      advice: this.redactPayload(advice),
+      headers: {
+        requestId: error.response?.headers?.['x-request-id'] ?? 'N/A',
+        traceId: error.response?.headers?.['x-trace-id'] ?? 'N/A',
+        correlationId: error.response?.headers?.['x-correlation-id'] ?? 'N/A',
+      },
+      request: {
+        ...(error.config?.method ? { method: error.config.method } : {}),
+        ...(error.config?.url ? { url: error.config.url } : {}),
+        ...(error.config?.timeout ? { timeout: error.config.timeout } : {}),
+        ...(context.stage ? { stage: context.stage } : {}),
+        ...(requestData !== undefined ? { data: requestData } : {}),
+      },
+    };
+
+    return {
+      error: innovatricsError,
+      logPayload,
+    };
+  }
+
+  private throwInnovatricsError(
+    error: any,
+    context: { operation: string; stage?: string }
+  ): never {
+    const normalized = this.normalizeAxiosError(error, context);
+    console.error(
+      `Innovatrics ${context.operation} error:`,
+      normalized.logPayload
+    );
+    throw normalized.error;
+  }
+
+  private isClassificationAdviceError(error: any): boolean {
+    const err = error instanceof InnovatricsApiError ? error : undefined;
+    const errorCode =
+      err?.context.errorCode ?? error?.response?.data?.errorCode;
+    const errorMessage =
+      err?.context.errorMessage ?? error?.response?.data?.errorMessage ?? '';
+
+    if (errorCode !== 'INVALID_REQUEST_BODY') {
+      return false;
+    }
+
+    return /advice\.classification/i.test(errorMessage || '');
+  }
+
   async createCustomer(): Promise<CreateCustomerResponse> {
     try {
       console.log('Creating customer in Innovatrics');
@@ -200,20 +713,7 @@ export class InnovatricsService {
       console.log('Customer creation successful:', response.data);
       return response.data;
     } catch (error: any) {
-      console.error('Detailed customer creation error:', {
-        status: error.response?.status,
-        data: error.response?.data,
-        headers: error.response?.headers,
-        config: {
-          url: error.config?.url,
-          method: error.config?.method,
-          baseURL: error.config?.baseURL,
-          headers: error.config?.headers,
-        },
-      });
-      throw new Error(
-        `Failed to create customer: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, { operation: 'create customer' });
     }
   }
 
@@ -234,9 +734,9 @@ export class InnovatricsService {
     try {
       await this.client.post(`/customers/${customerId}/store`, payload);
     } catch (error: any) {
-      throw new Error(
-        `Failed to store customer: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, {
+        operation: 'store customer',
+      });
     }
   }
 
@@ -252,7 +752,9 @@ export class InnovatricsService {
   }
 
   // Face Biometrics
-  async detectFace(imageData: InnovatricsImagePayload): Promise<CreateFaceResponse> {
+  async detectFace(
+    imageData: InnovatricsImagePayload
+  ): Promise<CreateFaceResponse> {
     try {
       const response = await this.client.post('/faces', {
         image: this.buildImagePayload(imageData),
@@ -309,12 +811,42 @@ export class InnovatricsService {
   // Customer Inspection - compares document portrait with selfie
   async inspectCustomer(customerId: string): Promise<any> {
     try {
-      const response = await this.client.post(`/customers/${customerId}/inspect`);
+      const response = await this.client.post(
+        `/customers/${customerId}/inspect`
+      );
       return response.data;
     } catch (error: any) {
       throw new Error(
         `Failed to inspect customer: ${error.response?.data?.message || error.message}`
       );
+    }
+  }
+
+  // Re-inspect document after selfie upload to get face comparison
+  async reinspectDocument(customerId: string): Promise<any> {
+    try {
+      const response = await this.client.post(
+        `/customers/${customerId}/document/inspect`
+      );
+      return response.data;
+    } catch (error: any) {
+      this.throwInnovatricsError(error, {
+        operation: 'reinspect document',
+      });
+    }
+  }
+
+  // Get document portrait image
+  async getDocumentPortrait(customerId: string): Promise<any> {
+    try {
+      const response = await this.client.get(
+        `/customers/${customerId}/document/portrait`
+      );
+      return response.data;
+    } catch (error: any) {
+      this.throwInnovatricsError(error, {
+        operation: 'get document portrait',
+      });
     }
   }
 
@@ -330,13 +862,19 @@ export class InnovatricsService {
         if (challengeRequest.type) {
           payload.type = challengeRequest.type;
         }
-        if (challengeRequest.options && Object.keys(challengeRequest.options).length > 0) {
+        if (
+          challengeRequest.options &&
+          Object.keys(challengeRequest.options).length > 0
+        ) {
           payload.options = challengeRequest.options;
         }
       }
-      
-      console.log('DEBUG: Liveness challenge payload:', JSON.stringify(payload));
-      
+
+      console.log(
+        'DEBUG: Liveness challenge payload:',
+        JSON.stringify(payload)
+      );
+
       const response = await this.client.put(
         `/customers/${customerId}/liveness/records/challenge`,
         payload
@@ -354,25 +892,27 @@ export class InnovatricsService {
       await this.client.put(`/customers/${customerId}/liveness`);
       console.log('Liveness record initialized for customer:', customerId);
     } catch (error: any) {
-      throw new Error(
-        `Failed to initialize liveness record: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, {
+        operation: 'initialize liveness record',
+      });
     }
   }
 
   async uploadAdditionalSelfieLiveness(
     customerId: string,
-    selfieData: InnovatricsImagePayload
+    selfieData: InnovatricsImagePayload,
+    assertion: string = 'PASSIVE_LIVENESS'
   ): Promise<void> {
     try {
       await this.client.post(`/customers/${customerId}/liveness/selfies`, {
         image: this.buildImagePayload(selfieData),
+        assertion: assertion, // Required: type of liveness check
       });
       console.log('Additional liveness selfie uploaded for customer:', customerId);
     } catch (error: any) {
-      throw new Error(
-        `Failed to upload additional selfie: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, {
+        operation: 'upload additional liveness selfie',
+      });
     }
   }
 
@@ -400,9 +940,9 @@ export class InnovatricsService {
       );
       return response.data;
     } catch (error: any) {
-      throw new Error(
-        `Failed to submit liveness data: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, {
+        operation: 'submit liveness data',
+      });
     }
   }
 
@@ -440,7 +980,10 @@ export class InnovatricsService {
         type: 'PASSIVE_LIVENESS',
       };
 
-      console.log('DEBUG: Passive liveness evaluation payload:', JSON.stringify(payload));
+      console.log(
+        'DEBUG: Passive liveness evaluation payload:',
+        JSON.stringify(payload)
+      );
 
       const response = await this.client.post(
         `/customers/${customerId}/liveness/evaluation`,
@@ -448,7 +991,10 @@ export class InnovatricsService {
       );
 
       const result = response.data;
-      console.log('Passive liveness raw response:', JSON.stringify(result, null, 2));
+      console.log(
+        'Passive liveness raw response:',
+        JSON.stringify(result, null, 2)
+      );
 
       // Check for errors in response
       if (result.errorCode) {
@@ -457,8 +1003,12 @@ export class InnovatricsService {
           console.warn('   This usually means:');
           console.warn('   - Selfie image quality is too low');
           console.warn('   - Face not clearly visible');
-          console.warn('   - Image too small (recommend 1800px+ with clear face)');
-          console.warn('   - Consider uploading additional selfie frames via additionalSelfies option');
+          console.warn(
+            '   - Image too small (recommend 1800px+ with clear face)'
+          );
+          console.warn(
+            '   - Consider uploading additional selfie frames via additionalSelfies option'
+          );
         }
         // Return default values when not enough data
         return {
@@ -474,7 +1024,10 @@ export class InnovatricsService {
           livenessResources: ['PASSIVE'],
         };
 
-        console.log('DEBUG: Extended deepfake evaluation payload:', JSON.stringify(extendedPayload));
+        console.log(
+          'DEBUG: Extended deepfake evaluation payload:',
+          JSON.stringify(extendedPayload)
+        );
 
         const extendedResponse = await this.client.post(
           `/customers/${customerId}/liveness/evaluation/extended`,
@@ -482,7 +1035,10 @@ export class InnovatricsService {
         );
 
         const extendedResult = extendedResponse.data;
-        console.log('Deepfake raw response:', JSON.stringify(extendedResult, null, 2));
+        console.log(
+          'Deepfake raw response:',
+          JSON.stringify(extendedResult, null, 2)
+        );
 
         return {
           confidence: result.confidence || 0,
@@ -497,7 +1053,9 @@ export class InnovatricsService {
         status: result.status as 'live' | 'not_live' | 'suspicious',
       };
     } catch (error: any) {
-      throw new Error(`Liveness evaluation failed: ${error.message}`);
+      this.throwInnovatricsError(error, {
+        operation: 'evaluate liveness',
+      });
     }
   }
 
@@ -505,9 +1063,9 @@ export class InnovatricsService {
     try {
       await this.client.delete(`/api/v1/customers/${customerId}/liveness`);
     } catch (error: any) {
-      throw new Error(
-        `Failed to delete liveness data: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, {
+        operation: 'delete liveness data',
+      });
     }
   }
 
@@ -515,35 +1073,103 @@ export class InnovatricsService {
   async verifyDocument(
     request: DocumentVerificationRequest
   ): Promise<DocumentVerificationResult> {
-    const { customerId, frontImage, backImage, documentType, issuingCountry } = request;
+    const { customerId, frontImage, backImage, documentType, issuingCountry } =
+      request;
 
     const frontImagePayload = this.buildImagePayload(frontImage);
-    const backImagePayload = backImage ? this.buildImagePayload(backImage) : undefined;
+    const backImagePayload = backImage
+      ? this.buildImagePayload(backImage)
+      : undefined;
 
     try {
       const classificationAdvice: Record<string, any> = {};
-      if (documentType) {
-        classificationAdvice.types = [documentType];
-      }
-      if (issuingCountry) {
-        classificationAdvice.countries = [issuingCountry];
+      const classificationWarnings: string[] = [];
+      let shouldSendAdvice = false;
+
+      const normalizedDocumentType =
+        this.normalizeDocumentTypeForAdvice(documentType);
+      const normalizedCountry = this.normalizeCountryForAdvice(issuingCountry);
+
+      if (normalizedDocumentType === 'PASSPORT') {
+        classificationAdvice.types = [normalizedDocumentType];
+        if (normalizedCountry) {
+          classificationAdvice.countries = [normalizedCountry];
+        }
+        shouldSendAdvice = true;
+      } else if (normalizedDocumentType) {
+        if (normalizedCountry) {
+          classificationAdvice.types = [normalizedDocumentType];
+          classificationAdvice.countries = [normalizedCountry];
+          shouldSendAdvice = true;
+        } else {
+          classificationWarnings.push(
+            `Issuing country is required when documentType "${documentType}" is provided`
+          );
+        }
+      } else if (documentType) {
+        classificationWarnings.push(
+          `Unsupported documentType "${documentType}"`
+        );
       }
 
-      const createDocumentPayload: Record<string, any> = {
+      if (
+        !shouldSendAdvice &&
+        normalizedCountry &&
+        !classificationAdvice.countries
+      ) {
+        classificationAdvice.countries = [normalizedCountry];
+        shouldSendAdvice = true;
+      } else if (!shouldSendAdvice && issuingCountry) {
+        classificationWarnings.push(
+          `Unsupported issuingCountry "${issuingCountry}"`
+        );
+      }
+
+      const baseDocumentPayload = {
         sources: ['VIZ', 'MRZ', 'DOCUMENT_PORTRAIT'],
-      };
+      } as const;
 
-      if (Object.keys(classificationAdvice).length > 0) {
-        createDocumentPayload.advice = {
+      let advicePayload: { classification: Record<string, any> } | undefined;
+      if (shouldSendAdvice && Object.keys(classificationAdvice).length > 0) {
+        console.log(
+          'Innovatrics document classification advice:',
+          classificationAdvice
+        );
+        advicePayload = {
           classification: classificationAdvice,
         };
+      } else {
+        console.warn(
+          'No Innovatrics classification advice will be sent (fallback to auto-detect).',
+          {
+            documentType,
+            issuingCountry,
+            warnings: classificationWarnings,
+          }
+        );
+      }
+
+      if (classificationWarnings.length > 0) {
+        console.warn('Innovatrics classification warnings:', {
+          warnings: classificationWarnings,
+          documentType,
+          issuingCountry,
+        });
       }
 
       const documentRetryOptions = {
         shouldRetry: (error: any) => this.isRetryableError(error),
         ...(request.onRetry
           ? {
-              onRetry: ({ attempt, delayMs, error }: { attempt: number; delayMs: number; error: any }) => {
+              onRetry: ({
+                attempt,
+                delayMs,
+                error,
+              }: {
+                attempt: number;
+                delayMs: number;
+                error: any;
+              }) => {
                 request.onRetry?.({
                   stage: 'create_document',
                   attempt,
@@ -555,11 +1181,46 @@ export class InnovatricsService {
           : {}),
       } satisfies RetryOptions;
 
-      const documentResponse = await withRetry(
-        () =>
-          this.client.put(`/customers/${customerId}/document`, createDocumentPayload),
-        documentRetryOptions
-      );
+      const createDocumentWithAdvice = async (payloadAdvice?: {
+        classification: Record<string, any>;
+      }) => {
+        const payload = payloadAdvice
+          ? {
+              ...baseDocumentPayload,
+              advice: payloadAdvice,
+            }
+          : {
+              ...baseDocumentPayload,
+            };
+
+        return withRetry(
+          () => this.client.put(`/customers/${customerId}/document`, payload),
+          documentRetryOptions
+        );
+      };
+
+      let documentResponse;
+      try {
+        documentResponse = await createDocumentWithAdvice(advicePayload);
+      } catch (error) {
+        if (advicePayload && this.isClassificationAdviceError(error)) {
+          console.warn(
+            'Innovatrics rejected document classification advice, retrying without advice.',
+            {
+              documentType,
+              issuingCountry,
+              advicePayload,
+              error:
+                error instanceof InnovatricsApiError
+                  ? error.serialize()
+                  : error,
+            }
+          );
+          documentResponse = await createDocumentWithAdvice(undefined);
+        } else {
+          throw error;
+        }
+      }
 
       const pages: DocumentPageResult[] = [];
 
@@ -567,7 +1228,15 @@ export class InnovatricsService {
         shouldRetry: (error: any) => this.isRetryableError(error),
         ...(request.onRetry
           ? {
-              onRetry: ({ attempt, delayMs, error }: { attempt: number; delayMs: number; error: any }) => {
+              onRetry: ({
+                attempt,
+                delayMs,
+                error,
+              }: {
+                attempt: number;
+                delayMs: number;
+                error: any;
+              }) => {
                 request.onRetry?.({
                   stage: 'upload_page_front',
                   attempt,
@@ -598,7 +1267,15 @@ export class InnovatricsService {
           shouldRetry: (error: any) => this.isRetryableError(error),
           ...(request.onRetry
             ? {
-                onRetry: ({ attempt, delayMs, error }: { attempt: number; delayMs: number; error: any }) => {
+                onRetry: ({
+                  attempt,
+                  delayMs,
+                  error,
+                }: {
+                  attempt: number;
+                  delayMs: number;
+                  error: any;
+                }) => {
                   request.onRetry?.({
                     stage: 'upload_page_back',
                     attempt,
@@ -629,7 +1306,15 @@ export class InnovatricsService {
         shouldRetry: (error: any) => this.isRetryableError(error),
         ...(request.onRetry
           ? {
-              onRetry: ({ attempt, delayMs, error }: { attempt: number; delayMs: number; error: any }) => {
+              onRetry: ({
+                attempt,
+                delayMs,
+                error,
+              }: {
+                attempt: number;
+                delayMs: number;
+                error: any;
+              }) => {
                 request.onRetry?.({
                   stage: 'inspect_document',
                   attempt,
@@ -652,7 +1337,15 @@ export class InnovatricsService {
           shouldRetry: (error: any) => this.isRetryableError(error),
           ...(request.onRetry
             ? {
-                onRetry: ({ attempt, delayMs, error }: { attempt: number; delayMs: number; error: any }) => {
+                onRetry: ({
+                  attempt,
+                  delayMs,
+                  error,
+                }: {
+                  attempt: number;
+                  delayMs: number;
+                  error: any;
+                }) => {
                   request.onRetry?.({
                     stage: 'disclose_inspection',
                     attempt,
@@ -665,7 +1358,10 @@ export class InnovatricsService {
         } satisfies RetryOptions;
 
         const disclosedResponse = await withRetry(
-          () => this.client.post(`/customers/${customerId}/document/inspect/disclose`),
+          () =>
+            this.client.post(
+              `/customers/${customerId}/document/inspect/disclose`
+            ),
           discloseRetryOptions
         );
         disclosedInspection = disclosedResponse.data;
@@ -676,7 +1372,8 @@ export class InnovatricsService {
         });
       }
 
-      const frontPage = pages.find(page => page.pageType === 'front') ?? pages[0];
+      const frontPage =
+        pages.find(page => page.pageType === 'front') ?? pages[0];
       const collectedWarnings = pages.flatMap(page => page.warnings ?? []);
       const collectedErrors = pages
         .map(page => page.errorCode)
@@ -705,9 +1402,9 @@ export class InnovatricsService {
         disclosedInspection,
       };
     } catch (error: any) {
-      throw new Error(
-        `Failed to process document: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, {
+        operation: 'process document',
+      });
     }
   }
 
@@ -725,9 +1422,9 @@ export class InnovatricsService {
       );
       return response.data;
     } catch (error: any) {
-      throw new Error(
-        `Failed to upload selfie: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, {
+        operation: 'upload selfie',
+      });
     }
   }
 
@@ -738,9 +1435,9 @@ export class InnovatricsService {
       );
       return response.data;
     } catch (error: any) {
-      throw new Error(
-        `Failed to get selfie: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, {
+        operation: 'get selfie',
+      });
     }
   }
 
@@ -748,9 +1445,9 @@ export class InnovatricsService {
     try {
       await this.client.delete(`/api/v1/customers/${customerId}/selfie`);
     } catch (error: any) {
-      throw new Error(
-        `Failed to delete selfie: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, {
+        operation: 'delete selfie',
+      });
     }
   }
 
@@ -768,9 +1465,9 @@ export class InnovatricsService {
       });
       return response.data;
     } catch (error: any) {
-      throw new Error(
-        `Failed to upload binary image: ${error.response?.data?.message || error.message}`
-      );
+      this.throwInnovatricsError(error, {
+        operation: 'upload binary image',
+      });
     }
   }
 
