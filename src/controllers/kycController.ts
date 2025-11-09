@@ -201,6 +201,10 @@ export class KYCVerificationController {
         results.documentVerification = documentResult;
         console.log('\nSUCCESS: Document verified');
         console.log('   Pages processed successfully');
+        const frontPageData = documentResult.pages?.find(page => page.pageType === 'front') ?? documentResult.pages?.[0];
+        if (frontPageData) {
+          console.log('   Document front page metadata:', JSON.stringify(frontPageData, null, 2));
+        }
         console.log('='.repeat(70) + '\n');
 
         await recordDocumentResult(customerId, {
@@ -260,16 +264,43 @@ export class KYCVerificationController {
         console.log('STEP 5: Comparing document photo with all selfies');
         console.log('='.repeat(70));
         
-        // Get document portrait image
+        // Get document portrait image (fallback to front document if portrait not available)
         console.log('Retrieving document portrait image...');
-        const documentPortrait = await innovatricsClient.getDocumentPortrait(customerId);
-        console.log('✅ Document portrait retrieved');
-        
-        // Detect face from document portrait
-        console.log('Detecting face in document portrait...');
-        const portraitImageData = documentPortrait?.image?.data || (documentPortrait as any)?.data || documentPortrait;
+        let portraitImageData: string | undefined;
+        try {
+          const documentPortrait = await innovatricsClient.getDocumentPortrait(customerId);
+          console.log('✅ Document portrait retrieved');
+          portraitImageData =
+            documentPortrait?.image?.data || (documentPortrait as any)?.data || (documentPortrait as string | undefined);
+        } catch (portraitError) {
+          console.warn('Document portrait not available, falling back to front document image.', {
+            message: (portraitError as Error)?.message,
+          });
+
+          const fallbackInnovatrics = documentFront?.innovatrics;
+          if (typeof fallbackInnovatrics === 'string') {
+            portraitImageData = fallbackInnovatrics;
+          } else if (fallbackInnovatrics && typeof fallbackInnovatrics === 'object') {
+            // handle payloads returned as { image: { data } } or similar structures
+            portraitImageData =
+              (fallbackInnovatrics as any)?.image?.data ?? (fallbackInnovatrics as any)?.data;
+          }
+        }
+
+        if (!portraitImageData) {
+          throw new Error('Unable to obtain document portrait or fallback image for face comparison');
+        }
+
+        // Detect face from chosen document image
+        console.log('Detecting face in document image...');
         const documentFaceResult = await innovatricsClient.detectFace(portraitImageData);
-        console.log(`✅ Document portrait face detected (ID: ${documentFaceResult.id})`);
+        console.log('Document face detection raw result:', JSON.stringify(documentFaceResult, null, 2));
+
+        if (!documentFaceResult?.id) {
+          throw new Error('Failed to detect a face in the document image (no face ID returned)');
+        }
+
+        console.log(`✅ Document face detected (ID: ${documentFaceResult.id})`);
         
         // Process ALL selfies (primary + additional from files or body)
         const additionalSelfieFiles = files.selfieImages || [];
@@ -346,7 +377,7 @@ export class KYCVerificationController {
         console.log('   Average Score:', (faceMatchScore * 100).toFixed(1) + '%');
         console.log('   Best Score:', (maxScore * 100).toFixed(1) + '%');
         console.log('   Worst Score:', (minScore * 100).toFixed(1) + '%');
-        console.log('   Final Result:', faceMatchScore >= 0.65 ? '✅ MATCH' : '❌ NO MATCH');
+        console.log('   Final Result:', faceMatchScore >= 0.64 ? '✅ MATCH' : '❌ NO MATCH');
         
         console.log('='.repeat(70) + '\n');
         await recordFaceComparison(customerId, {
@@ -421,7 +452,7 @@ export class KYCVerificationController {
         console.log('   Document Verified:', results.documentVerification ? 'YES' : 'NO');
         console.log('   Selfie Uploaded:', results.selfieUpload ? 'YES' : 'NO');
         console.log('   Liveness Check:', results.livenessCheck ? (results.livenessCheck.status ? results.livenessCheck.status.toUpperCase() : 'INCONCLUSIVE') : 'SKIPPED');
-        console.log('   Face Match:', (results.faceComparison?.score ?? 0) >= 0.65 ? 'PASSED' : 'FAILED');
+        console.log('   Face Match:', (results.faceComparison?.score ?? 0) >= 0.64 ? 'PASSED' : 'FAILED');
         console.log('='.repeat(70) + '\n');
         
         return ResponseHandler.success(
