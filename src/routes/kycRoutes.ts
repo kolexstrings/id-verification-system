@@ -15,17 +15,20 @@ const validateKYCProfile = [
     .isLength({ min: 1 })
     .withMessage('image must be provided when no selfie file is uploaded'),
   body('name')
+    .optional()
     .isString()
     .isLength({ min: 1, max: 100 })
-    .withMessage('name is required'),
+    .withMessage('name must be a non-empty string when provided'),
   body('surname')
+    .optional()
     .isString()
     .isLength({ min: 1, max: 100 })
-    .withMessage('surname is required'),
+    .withMessage('surname must be a non-empty string when provided'),
   body('dateOfBirth')
+    .optional()
     .isString()
     .isLength({ min: 1 })
-    .withMessage('dateOfBirth is required'),
+    .withMessage('dateOfBirth must be provided when available'),
   body('userId')
     .optional()
     .isString()
