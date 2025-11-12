@@ -465,15 +465,19 @@ export class KYCVerificationController {
           }
         }
 
-        // Calculate average score for robustness
-        const faceMatchScore =
-          faceMatchScores.reduce((sum, score) => sum + score, 0) /
-          faceMatchScores.length;
-        const maxScore = Math.max(...faceMatchScores);
-        const minScore = Math.min(...faceMatchScores);
+        // Calculate summary scores
+        const averageScore =
+          faceMatchScores.length > 0
+            ? faceMatchScores.reduce((sum, score) => sum + score, 0) /
+              faceMatchScores.length
+            : 0;
+        const maxScore =
+          faceMatchScores.length > 0 ? Math.max(...faceMatchScores) : 0;
+        const minScore =
+          faceMatchScores.length > 0 ? Math.min(...faceMatchScores) : 0;
 
         results.faceComparison = {
-          score: faceMatchScore,
+          score: maxScore,
         };
 
         console.log('\n' + '='.repeat(70));
@@ -486,18 +490,18 @@ export class KYCVerificationController {
         );
         console.log(
           '   Average Score:',
-          (faceMatchScore * 100).toFixed(1) + '%'
+          (averageScore * 100).toFixed(1) + '%'
         );
         console.log('   Best Score:', (maxScore * 100).toFixed(1) + '%');
         console.log('   Worst Score:', (minScore * 100).toFixed(1) + '%');
         console.log(
           '   Final Result:',
-          faceMatchScore >= 0.64 ? '✅ MATCH' : '❌ NO MATCH'
+          maxScore >= 0.64 ? '✅ MATCH' : '❌ NO MATCH'
         );
 
         console.log('='.repeat(70) + '\n');
         await recordFaceComparison(customerId, {
-          comparisonResult: { score: faceMatchScore },
+          comparisonResult: { score: maxScore },
           image: primarySelfieSource.normalized,
         });
 
@@ -550,8 +554,8 @@ export class KYCVerificationController {
           image: primarySelfieSource.normalized,
         });
         const faceMatchPassed =
-          typeof faceMatchScore === 'number' &&
-          faceMatchScore >= FACE_MATCH_SUCCESS_THRESHOLD;
+          typeof maxScore === 'number' &&
+          maxScore >= FACE_MATCH_SUCCESS_THRESHOLD;
         const normalizedLivenessStatus = (livenessResult.status ?? '').toLowerCase();
         const livenessPassed = normalizedLivenessStatus === LIVENESS_SUCCESS_STATUS;
 
@@ -562,7 +566,7 @@ export class KYCVerificationController {
           if (!faceMatchPassed) {
             declineReasons.push('face_match_failed');
             declineMessages.push(
-              `Face comparison score ${(faceMatchScore * 100).toFixed(
+              `Face comparison score ${(maxScore * 100).toFixed(
                 1
               )}% is below the ${(FACE_MATCH_SUCCESS_THRESHOLD * 100).toFixed(0)}% threshold.`
             );
@@ -587,7 +591,7 @@ export class KYCVerificationController {
             markFailed: true,
             context: {
               faceMatch: {
-                score: faceMatchScore,
+                score: maxScore,
                 threshold: FACE_MATCH_SUCCESS_THRESHOLD,
               },
               liveness: livenessResult,
@@ -606,7 +610,7 @@ export class KYCVerificationController {
             declineReasonTag,
             {
               faceMatch: {
-                score: faceMatchScore,
+                score: maxScore,
                 threshold: FACE_MATCH_SUCCESS_THRESHOLD,
                 passed: faceMatchPassed,
               },
