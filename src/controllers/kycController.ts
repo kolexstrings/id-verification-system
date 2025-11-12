@@ -23,6 +23,9 @@ import {
 
 const innovatricsClient = new InnovatricsService();
 
+const FACE_MATCH_SUCCESS_THRESHOLD = 0.64;
+const LIVENESS_SUCCESS_STATUS = 'live';
+
 export interface KYCProfile {
   createdAt: number;
   phoneNumber: string;
@@ -546,6 +549,76 @@ export class KYCVerificationController {
           livenessResult,
           image: primarySelfieSource.normalized,
         });
+        const faceMatchPassed =
+          typeof faceMatchScore === 'number' &&
+          faceMatchScore >= FACE_MATCH_SUCCESS_THRESHOLD;
+        const normalizedLivenessStatus = (livenessResult.status ?? '').toLowerCase();
+        const livenessPassed = normalizedLivenessStatus === LIVENESS_SUCCESS_STATUS;
+
+        if (!faceMatchPassed || !livenessPassed) {
+          const declineReasons: string[] = [];
+          const declineMessages: string[] = [];
+
+          if (!faceMatchPassed) {
+            declineReasons.push('face_match_failed');
+            declineMessages.push(
+              `Face comparison score ${(faceMatchScore * 100).toFixed(
+                1
+              )}% is below the ${(FACE_MATCH_SUCCESS_THRESHOLD * 100).toFixed(0)}% threshold.`
+            );
+          }
+
+          if (!livenessPassed) {
+            declineReasons.push('liveness_failed');
+            declineMessages.push('Liveness check returned a non-live status.');
+          }
+
+          const declineReasonTag = declineReasons.join('|') || 'kyc_failed';
+          const declineContent =
+            declineMessages.length > 0
+              ? `KYC verification declined. ${declineMessages.join(' ')}`
+              : 'KYC verification declined due to unmet biometric requirements.';
+
+          results.overallStatus = 'failed';
+          results.updatedAt = new Date();
+
+          await recordError(customerId, {
+            message: declineContent,
+            markFailed: true,
+            context: {
+              faceMatch: {
+                score: faceMatchScore,
+                threshold: FACE_MATCH_SUCCESS_THRESHOLD,
+              },
+              liveness: livenessResult,
+            },
+          }).catch(() => undefined);
+
+          console.log('KYC verification declined:', {
+            reasons: declineReasons,
+            messages: declineMessages,
+          });
+
+          return ResponseHandler.error(
+            res,
+            declineContent,
+            422,
+            declineReasonTag,
+            {
+              faceMatch: {
+                score: faceMatchScore,
+                threshold: FACE_MATCH_SUCCESS_THRESHOLD,
+                passed: faceMatchPassed,
+              },
+              liveness: {
+                status: livenessResult.status,
+                confidence: livenessResult.confidence,
+                passed: livenessPassed,
+              },
+              results,
+            }
+          );
+        }
 
         // Update overall status
         results.overallStatus = 'completed';
@@ -575,18 +648,8 @@ export class KYCVerificationController {
           results.documentVerification ? 'YES' : 'NO'
         );
         console.log('   Selfie Uploaded:', results.selfieUpload ? 'YES' : 'NO');
-        console.log(
-          '   Liveness Check:',
-          results.livenessCheck
-            ? results.livenessCheck.status
-              ? results.livenessCheck.status.toUpperCase()
-              : 'INCONCLUSIVE'
-            : 'SKIPPED'
-        );
-        console.log(
-          '   Face Match:',
-          (results.faceComparison?.score ?? 0) >= 0.64 ? 'PASSED' : 'FAILED'
-        );
+        console.log('   Liveness Check: LIVE');
+        console.log('   Face Match: PASSED');
         console.log('='.repeat(70) + '\n');
 
         return ResponseHandler.success(
