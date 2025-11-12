@@ -29,13 +29,30 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// CORS configuration (more permissive for testing)
+const isProduction = process.env.NODE_ENV === 'production';
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(origin => origin.length > 0);
+
 app.use(
   cors({
-    origin:
-      process.env.NODE_ENV === 'production'
-        ? process.env.FRONTEND_URL?.split(',')
-        : true, // Allow all origins in development
+    origin: (origin, callback) => {
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (!isProduction) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.warn(`CORS: blocked origin ${origin}. Add it to ALLOWED_ORIGINS.`);
+      return callback(new Error('Not allowed by CORS'), false);
+    },
     credentials: true,
   })
 );

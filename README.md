@@ -397,11 +397,14 @@ If migrations fail with `P1001` (cannot reach database), double-check:
 
 ## Environment Variables
 
-| Variable | Description | Required | Default |
-|----------|-------------|----------|---------|
-| `PORT` | Server port number | No | `3000` |
-| `INNOVATRICS_BASE_URL` | Innovatrics DIS API base URL | Yes | - |
-| `INNOVATRICS_API_KEY` | Innovatrics API authentication key | Yes | - |
+Create a `.env` file in the project root. Refer to `.env.example` for all supported keys.
+
+| Variable | Description | Required |
+| --- | --- | --- |
+| `PORT` | API server port | No (default: `3000`)
+| `NODE_ENV` | Deployment environment (`development`, `production`, etc.) | No
+| `FRONTEND_URL` | Comma-separated list of allowed frontend origins for CORS (fallback for compatibility) | No
+| `ALLOWED_ORIGINS` | Comma-separated list of allowed origins for CORS (takes precedence over `FRONTEND_URL`) | No (required in production)
 | `INNOVATRICS_API_SECRET` | Innovatrics API secret key | Yes | - |
 
 ## API Usage Examples
